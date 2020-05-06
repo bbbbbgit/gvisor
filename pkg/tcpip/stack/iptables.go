@@ -178,7 +178,7 @@ const (
 // dropped.
 //
 // Precondition: pkt.NetworkHeader is set.
-func (it *IPTables) Check(hook Hook, pkt *PacketBuffer, gso *GSO, r *Route, address tcpip.Address) bool {
+func (it *IPTables) Check(hook Hook, pkt *PacketBuffer, gso *GSO, r *Route, address tcpip.Address, nicName string) bool {
 	// Packets are manipulated only if connection and matching
 	// NAT rule exists.
 	it.connections.HandlePacket(pkt, hook, gso, r)
@@ -187,7 +187,7 @@ func (it *IPTables) Check(hook Hook, pkt *PacketBuffer, gso *GSO, r *Route, addr
 	for _, tablename := range it.Priorities[hook] {
 		table := it.Tables[tablename]
 		ruleIdx := table.BuiltinChains[hook]
-		switch verdict := it.checkChain(hook, pkt, table, ruleIdx, gso, r, address); verdict {
+		switch verdict := it.checkChain(hook, pkt, table, ruleIdx, gso, r, address, nicName); verdict {
 		// If the table returns Accept, move on to the next table.
 		case chainAccept:
 			continue
@@ -228,10 +228,10 @@ func (it *IPTables) Check(hook Hook, pkt *PacketBuffer, gso *GSO, r *Route, addr
 //
 // NOTE: unlike the Check API the returned map contains packets that should be
 // dropped.
-func (it *IPTables) CheckPackets(hook Hook, pkts PacketBufferList, gso *GSO, r *Route) (drop map[*PacketBuffer]struct{}, natPkts map[*PacketBuffer]struct{}) {
+func (it *IPTables) CheckPackets(hook Hook, pkts PacketBufferList, gso *GSO, r *Route, nicName string) (drop map[*PacketBuffer]struct{}, natPkts map[*PacketBuffer]struct{}) {
 	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
 		if !pkt.NatDone {
-			if ok := it.Check(hook, pkt, gso, r, ""); !ok {
+			if ok := it.Check(hook, pkt, gso, r, "", nicName); !ok {
 				if drop == nil {
 					drop = make(map[*PacketBuffer]struct{})
 				}
@@ -251,11 +251,11 @@ func (it *IPTables) CheckPackets(hook Hook, pkts PacketBufferList, gso *GSO, r *
 // Precondition: pkt is a IPv4 packet of at least length header.IPv4MinimumSize.
 // TODO(gvisor.dev/issue/170): pkt.NetworkHeader will always be set as a
 // precondition.
-func (it *IPTables) checkChain(hook Hook, pkt *PacketBuffer, table Table, ruleIdx int, gso *GSO, r *Route, address tcpip.Address) chainVerdict {
+func (it *IPTables) checkChain(hook Hook, pkt *PacketBuffer, table Table, ruleIdx int, gso *GSO, r *Route, address tcpip.Address, nicName string) chainVerdict {
 	// Start from ruleIdx and walk the list of rules until a rule gives us
 	// a verdict.
 	for ruleIdx < len(table.Rules) {
-		switch verdict, jumpTo := it.checkRule(hook, pkt, table, ruleIdx, gso, r, address); verdict {
+		switch verdict, jumpTo := it.checkRule(hook, pkt, table, ruleIdx, gso, r, address, nicName); verdict {
 		case RuleAccept:
 			return chainAccept
 
@@ -272,7 +272,7 @@ func (it *IPTables) checkChain(hook Hook, pkt *PacketBuffer, table Table, ruleId
 				ruleIdx++
 				continue
 			}
-			switch verdict := it.checkChain(hook, pkt, table, jumpTo, gso, r, address); verdict {
+			switch verdict := it.checkChain(hook, pkt, table, jumpTo, gso, r, address, nicName); verdict {
 			case chainAccept:
 				return chainAccept
 			case chainDrop:
@@ -298,7 +298,7 @@ func (it *IPTables) checkChain(hook Hook, pkt *PacketBuffer, table Table, ruleId
 // Precondition: pkt is a IPv4 packet of at least length header.IPv4MinimumSize.
 // TODO(gvisor.dev/issue/170): pkt.NetworkHeader will always be set as a
 // precondition.
-func (it *IPTables) checkRule(hook Hook, pkt *PacketBuffer, table Table, ruleIdx int, gso *GSO, r *Route, address tcpip.Address) (RuleVerdict, int) {
+func (it *IPTables) checkRule(hook Hook, pkt *PacketBuffer, table Table, ruleIdx int, gso *GSO, r *Route, address tcpip.Address, nicName string) (RuleVerdict, int) {
 	rule := table.Rules[ruleIdx]
 
 	// If pkt.NetworkHeader hasn't been set yet, it will be contained in
@@ -313,7 +313,7 @@ func (it *IPTables) checkRule(hook Hook, pkt *PacketBuffer, table Table, ruleIdx
 	}
 
 	// Check whether the packet matches the IP header filter.
-	if !filterMatch(rule.Filter, header.IPv4(pkt.NetworkHeader)) {
+	if !filterMatch(rule.Filter, header.IPv4(pkt.NetworkHeader), hook, nicName) {
 		// Continue on to the next rule.
 		return RuleJump, ruleIdx + 1
 	}
@@ -335,7 +335,7 @@ func (it *IPTables) checkRule(hook Hook, pkt *PacketBuffer, table Table, ruleIdx
 	return rule.Target.Action(pkt, &it.connections, hook, gso, r, address)
 }
 
-func filterMatch(filter IPHeaderFilter, hdr header.IPv4) bool {
+func filterMatch(filter IPHeaderFilter, hdr header.IPv4, hook Hook, nicName string) bool {
 	// TODO(gvisor.dev/issue/170): Support other fields of the filter.
 	// Check the transport protocol.
 	if filter.Protocol != 0 && filter.Protocol != hdr.TransportProtocol() {
@@ -353,6 +353,32 @@ func filterMatch(filter IPHeaderFilter, hdr header.IPv4) bool {
 	}
 	if matches == filter.DstInvert {
 		return false
+	}
+
+	// Check the output interface.
+	// TODO(gvisor.dev/issue/170): Add the check for FORWARD and POSTROUTING
+	// hooks after supported.
+	if hook == Output {
+		n := len(filter.OutputInterface)
+		if n == 0 {
+			return true
+		}
+
+		// If the interface name ends with '+', any interface which begins
+		// with the name should be matched.
+		ifname := filter.OutputInterface
+		if ch := ifname[n-1:]; ch == "+" {
+			ifname = ifname[:n-1]
+			if len(nicName) > n-1 {
+				nicName = nicName[:n-1]
+			}
+		}
+		matches = true
+		if ifname != nicName {
+			matches = false
+		}
+
+		return filter.OutputInterfaceInvert != matches
 	}
 
 	return true
